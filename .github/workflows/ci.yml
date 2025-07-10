@@ -1,0 +1,25 @@
+name: CI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build rust-api
+        run: docker build -t rust-api ./rust-api
+      - name: Build frontend
+        run: docker build -f frontend/Dockerfile.dev -t frontend ./frontend
+      - name: Docker Compose up
+        run: docker-compose -f docker-compose.dev.yml up -d --build
+      - name: Healthcheck rust-api
+        run: |
+          sleep 5
+          curl -f http://localhost:8080/healthz
+      - name: Healthcheck frontend
+        run: |
+          sleep 5
+          npm --prefix frontend run healthz
