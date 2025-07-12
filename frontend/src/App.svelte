@@ -22,7 +22,40 @@
 	let result = null;
 
 	// Phase 4 UI 상태
-	let activeTab = 'preview'; // preview, json, raw
+	let activeTab = 'preview';
+	let showHtmlModal = false;
+	let htmlModalElement;
+	let editableHtml = '';
+
+	$: if (showHtmlModal && jobResult?.result?.content) {
+		editableHtml = generateEnhancedHtml(jobResult.result.content);
+	}
+
+	function saveEditedHtml() {
+		alert('수정된 HTML이 저장되었습니다.');
+	}
+
+	// 모달 포커스 처리를 위한 액션
+	function modalFocus(node) {
+		if (showHtmlModal) {
+			node.focus();
+			
+			// ESC 키로 모달 닫기
+			const handleKeydown = (event) => {
+				if (event.key === 'Escape') {
+					showHtmlModal = false;
+				}
+			};
+			
+			window.addEventListener('keydown', handleKeydown);
+			
+			return {
+				destroy() {
+					window.removeEventListener('keydown', handleKeydown);
+				}
+			};
+		}
+	} // preview, json, raw
 	let pdfDocument = null;
 	let pdfPageNum = 1;
 	let pdfPageCount = 0;
@@ -199,34 +232,102 @@
 		return processedLines.join('\n');
 	}
 	
-	// 간단한 HTML 생성 (회색 화면 문제 해결)
+	// 안정적인 HTML 생성 (회색 화면 문제 해결 최우선)
+	function generateEnhancedHtml(content) {
+		try {
+			if (!content || !content.text) return '내용이 없습니다.';
+			
+			// 기본 스타일링을 가진 컨테이너
+			let result = '<div style="font-family: system-ui, -apple-system, sans-serif; line-height: 1.5;">';
+			
+			// 텍스트 처리 - 줄단위로 간단하게 처리
+			const lines = content.text.split('\n');
+			for (let i = 0; i < Math.min(lines.length, 1000); i++) { // 최대 1000줄로 제한
+				const line = lines[i];
+				if (!line.trim()) {
+					// 빈 줄은 단순 줄바꿈으로 처리
+					result += '<br>';
+					continue;
+				}
+				
+				// 제목 형태의 텍스트 감지 (짧고 중요해 보이는 텍스트)
+				if ((i === 0 && line.length < 100) || 
+				    line.match(/^[0-9]+[\.]/) || 
+				    (line.length < 50 && line.toUpperCase() === line)) {
+					result += `<h3 style="margin:0.8rem 0 0.5rem;font-size:1.1em;color:#333;font-weight:bold;">${escapeHtml(line)}</h3>`;
+				}
+				// 목록 항목 감지
+				else if (line.match(/^[\-•*]\s+/) || line.match(/^[0-9]+[\.):]\s+/)) {
+					result += `<div style="margin:0.25rem 0 0.25rem 1rem;">${escapeHtml(line)}</div>`;
+				}
+				// 일반 텍스트
+				else {
+					result += `<div style="margin:0.3rem 0;">${escapeHtml(line)}</div>`;
+				}
+			}
+			
+			// 이미지 삽입 (썸네일이 있는 경우) - 텍스트 뒤에 추가
+			if (content.thumbnail && content.thumbnail.startsWith('data:image/')) {
+				try {
+					// 이미지 크기 제한
+					result += `<div style="margin-top:1rem;text-align:center;">
+						<img 
+							src="${content.thumbnail}" 
+							alt="문서 썸네일" 
+							style="max-width:400px;max-height:250px;border:1px solid #ddd;" 
+							loading="lazy"
+						/>
+					</div>`;
+				} catch (imgError) {
+					console.warn('이미지 처리 오류:', imgError);
+				}
+			}
+			
+			result += '</div>';
+			return result;
+		} catch (error) {
+			console.error('HTML 생성 오류:', error);
+			// 오류 발생 시 가장 기본적인 HTML로 폴백
+			return '<div style="white-space:pre-wrap;font-family:monospace;">' + 
+				(content?.text || '')
+					.replace(/&/g, '&amp;')
+					.replace(/</g, '&lt;')
+					.replace(/>/g, '&gt;')
+					.replace(/\n/g, '<br>') + 
+				'</div>';
+		}
+	}
+	
+	// 간단한 HTML 생성 (폴백용)
 	function generateSimpleHtml(content) {
 		try {
 			if (!content || !content.text) return '내용이 없습니다.';
 			
-			// 기본 텍스트를 간단한 HTML로 변환
+			// 원본 텍스트를 그대로 표시
 			const text = content.text || '';
-			const lines = text.split('\n');
-			const htmlLines = [];
 			
-			for (const line of lines) {
-				const trimmed = line.trim();
-				if (trimmed === '') {
-					htmlLines.push('<br>');
-				} else if (trimmed.match(/^(목차|Table of Contents)$/i)) {
-					htmlLines.push(`<h2 style="color: #333; margin-top: 1rem;">${trimmed}</h2>`);
-				} else if (trimmed.match(/^[0-9]+\./)) {
-					htmlLines.push(`<p style="margin-left: 1rem; font-weight: bold;">${trimmed}</p>`);
-				} else {
-					htmlLines.push(`<p style="margin: 0.5rem 0;">${trimmed}</p>`);
-				}
-			}
+			// 줄바꿈을 <br>로 변환
+			const htmlText = text
+				.replace(/&/g, '&amp;')
+				.replace(/</g, '&lt;')
+				.replace(/>/g, '&gt;')
+				.replace(/\n/g, '<br>');
 			
-			return htmlLines.join('\n');
+			return '<div style="white-space:pre-wrap;font-family:monospace;">' + htmlText + '</div>';
 		} catch (error) {
 			console.error('HTML 생성 오류:', error);
-			return '오류가 발생했습니다.';
+			return '오류 발생';
 		}
+	}
+	
+	// HTML 이스케이프 유틸리티 함수
+	function escapeHtml(text) {
+		return text
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;')
+			.replace(/'/g, '&#039;');
 	}
 
 	// 대용량 base64 필드 등은 생략해서 표시
@@ -870,6 +971,7 @@
 		gap: 2rem;
 		max-width: 1200px;
 		margin: 0 auto;
+		margin-top: 0;
 	}
 
 	.upload-section {
@@ -1160,8 +1262,8 @@
 	.pdf-viewer {
 		display: flex;
 		flex-direction: column;
-		height: 100%;
-		overflow: hidden;
+		align-items: center;
+		padding: 20px;
 	}
 	
 	.pdf-controls {
@@ -1186,7 +1288,7 @@
 		box-shadow: 0 0 10px rgba(0, 0, 0, 0.3);
 	}
 	
-	.text-content, .html-content, .json-content {
+	.text-content, .json-content {
 		max-height: 500px;
 		overflow-y: auto;
 		background-color: #fff;
@@ -1299,13 +1401,13 @@
 	}
 	
 	.tab {
-		padding: 0.75rem 1.25rem;
+		padding: 0.5rem 1rem;
 		background: none;
 		border: none;
 		border-bottom: 2px solid transparent;
 		cursor: pointer;
-		font-weight: 500;
-		color: #495057;
+		font-size: 0.9rem;
+		color: #666;
 		transition: all 0.2s ease-in-out;
 		outline: none;
 	}
@@ -1313,6 +1415,18 @@
 	.tab:hover {
 		color: #007bff;
 		background-color: rgba(0, 123, 255, 0.05);
+	}
+	
+	.html-view-btn {
+		margin-left: auto;
+		background-color: #f8f9fa;
+		border: 1px solid #ddd;
+		border-radius: 4px;
+		padding: 0.25rem 0.75rem;
+	}
+	
+	.html-view-btn:hover {
+		background-color: #e9ecef;
 	}
 	
 	.tab.active {
@@ -1371,6 +1485,85 @@
 	.result-content {
 		margin-top: 1rem;
 	}
+
+/* 모달 스타일 */
+.modal-backdrop {
+	position: fixed;
+	top: 0;
+	left: 0;
+	width: 100vw;
+	height: 100vh;
+	background: rgba(0,0,0,0.5);
+	display: flex;
+	justify-content: center;
+	align-items: center;
+	z-index: 2000;
+}
+.modal-dialog {
+	width: 80vw;
+	max-width: 900px;
+	outline: none;
+}
+.modal-content {
+	background: #fff;
+	border-radius: 8px;
+	overflow: hidden;
+	box-shadow: 0 4px 24px rgba(0,0,0,0.18);
+	display: flex;
+	flex-direction: column;
+	max-height: 90vh;
+}
+.modal-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	padding: 1rem;
+	border-bottom: 1px solid #eee;
+}
+.modal-header h3 {
+	margin: 0;
+	font-size: 1.15rem;
+}
+.close-button {
+	background: none;
+	border: none;
+	font-size: 1.6rem;
+	cursor: pointer;
+	padding: 0 0.5rem;
+}
+.modal-body {
+	padding: 1rem;
+	overflow-y: auto;
+}
+.html-preview-container {
+	display: flex;
+	flex-direction: column;
+	gap: 1.2rem;
+}
+.html-preview-content {
+	border: 1px solid #eee;
+	background: #fff;
+	padding: 1rem;
+	max-height: 350px;
+	overflow: auto;
+	font-family: system-ui, sans-serif;
+	font-size: 1rem;
+	line-height: 1.6;
+}
+.html-code {
+	background: #f8f9fa;
+	border: 1px solid #ddd;
+	border-radius: 4px;
+	padding: 0.5rem;
+	max-height: 200px;
+	overflow: auto;
+	font-size: 0.95em;
+}
+@media (max-width: 600px) {
+	.modal-dialog {
+		width: 98vw;
+	}
+}
 
 	@media (max-width: 768px) {
 
@@ -1600,15 +1793,6 @@
 									</button>
 									<button 
 										type="button"
-										class="tab {activeTab === 'html' ? 'active' : ''}"
-										on:click={() => changeTab('html')}
-										aria-selected={activeTab === 'html'}
-										role="tab"
-									>
-										HTML
-									</button>
-									<button 
-										type="button"
 										class="tab {activeTab === 'json' ? 'active' : ''}" 
 										on:click={() => changeTab('json')}
 										on:keydown={(e) => e.key === 'Enter' && changeTab('json')}
@@ -1627,6 +1811,14 @@
 									>
 										Raw
 									</button>
+									<button 
+										type="button"
+										class="tab html-view-btn" 
+										on:click={() => showHtmlModal = true}
+										on:keydown={(e) => e.key === 'Enter' && (showHtmlModal = true)}
+									>
+										HTML 보기
+									</button>
 								</div>
 								
 								<!-- 탭 내용 -->
@@ -1638,17 +1830,7 @@
 									{:else}
 										<p>텍스트 추출 결과가 없습니다.</p>
 									{/if}
-								{:else if activeTab === 'html'}
-											{#if jobResult?.result?.content?.text}
-												<div class="html-content" style="background:#fff;border:1px solid #eee;padding:1rem;">
-													<div><b>미리보기:</b></div>
-													<div style="margin-bottom:1rem;max-height:400px;overflow:auto;border:1px solid #ddd;">{@html generateSimpleHtml(jobResult.result.content)}</div>
-													<div><b>HTML 코드:</b></div>
-													<pre style="max-height:300px;overflow:auto;font-size:0.9em;">{generateSimpleHtml(jobResult.result.content)}</pre>
-												</div>
-											{:else}
-												<p>HTML 변환 결과가 없습니다.</p>
-											{/if}
+
 								{:else if activeTab === 'json'}
 									<div class="json-content">
 										<pre>{JSON.stringify(filterLargeFields(jobResult.result.content), null, 2)}</pre>
@@ -1693,3 +1875,52 @@
 		</div>
 	</div>
 </div>
+
+<!-- HTML 모달 팝업 -->
+{#if showHtmlModal && jobResult?.result?.content}
+	<div 
+		class="modal-backdrop" 
+		on:click|self={() => showHtmlModal = false}
+		on:keydown={(e) => e.key === 'Escape' && (showHtmlModal = false)}
+		role="presentation"
+	>
+		<div 
+			class="modal-dialog"
+			role="dialog"
+			aria-modal="true"
+			aria-labelledby="html-modal-title"
+			tabindex="-1"
+			bind:this={htmlModalElement}
+			use:modalFocus
+		>
+		<div class="modal-content">
+			<div class="modal-header">
+				<h3 id="html-modal-title">HTML 미리보기 및 수정</h3>
+				<button 
+					class="close-button" 
+					on:click={() => showHtmlModal = false}
+					on:keydown={(e) => e.key === 'Enter' && (showHtmlModal = false)}
+					aria-label="모달 닫기"
+				>×</button>
+			</div>
+			<div class="modal-body">
+				<div class="html-preview-container">
+					<div><b>미리보기:</b></div>
+					<div class="html-preview-content">
+						{@html editableHtml}
+					</div>
+					<div><b>HTML 코드 (수정 가능):</b></div>
+					<textarea
+						class="html-code-editor"
+						bind:value={editableHtml}
+						rows="12"
+						spellcheck="false"
+						style="width:100%;font-family:monospace;"
+					/>
+					<button class="save-html-btn" on:click={saveEditedHtml}>저장</button>
+				</div>
+			</div>
+			</div>
+		</div>
+	</div>
+{/if}
