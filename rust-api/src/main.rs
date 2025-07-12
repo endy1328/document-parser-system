@@ -1,84 +1,56 @@
-use actix_web::{get, post, App, HttpServer, Responder, HttpResponse, Error};
-use actix_multipart::Multipart;
-use futures_util::stream::StreamExt;
-use std::io::Write;
-use std::fs;
-use serde_json::json;
+mod handlers;
+mod models;
+mod services;
 
-#[get("/healthz")]
-async fn healthz() -> impl Responder {
-    "OK"
-}
-
-#[post("/upload")]
-async fn upload(mut payload: Multipart) -> Result<HttpResponse, Error> {
-    // uploads 폴더 생성
-    let upload_dir = "uploads";
-    fs::create_dir_all(upload_dir).ok();
-
-    while let Some(item) = payload.next().await {
-        let mut field = item?;
-        // 필요한 정보를 먼저 복사
-        let filename = field.content_disposition()
-            .get_filename()
-            .map(|s| s.to_string())
-            .unwrap_or("file".to_string());
-        let filepath = format!("{}/{}", upload_dir, filename);
-        let is_pdf = filename.to_lowercase().ends_with(".pdf");
-
-        let mut f = fs::File::create(&filepath)?;
-        while let Some(chunk) = field.next().await {
-            let chunk = chunk?;
-            f.write_all(&chunk)?;
-        }
-        // PDF 텍스트 추출 (pdftotext 외부 명령어 사용)
-        if is_pdf {
-            use std::process::Command;
-            match Command::new("pdftotext").arg(&filepath).arg("-").output() {
-                Ok(output) => {
-                    if output.status.success() {
-                        let text = String::from_utf8_lossy(&output.stdout).to_string();
-                        return Ok(HttpResponse::Ok().json(json!({
-                            "status": "success",
-                            "filename": filename,
-                            "text": text
-                        })));
-                    } else {
-                        let err = String::from_utf8_lossy(&output.stderr).to_string();
-                        return Ok(HttpResponse::Ok().json(json!({
-                            "status": "fail",
-                            "filename": filename,
-                            "error": format!("pdftotext 오류: {}", err)
-                        })));
-                    }
-                },
-                Err(e) => {
-                    return Ok(HttpResponse::Ok().json(json!({
-                        "status": "fail",
-                        "filename": filename,
-                        "error": format!("pdftotext 실행 실패: {}", e)
-                    })));
-                }
-            }
-        } else {
-            return Ok(HttpResponse::Ok().json(json!({
-                "status": "success",
-                "filename": filename,
-                "message": "PDF가 아닌 파일은 저장만 합니다."
-            })));
-        }
-    }
-    Ok(HttpResponse::BadRequest().body("파일이 업로드되지 않았습니다."))
-}
+use actix_web::{App, HttpServer, web};
+use actix_cors::Cors;
+use handlers::{health::healthz, upload::upload, job::{get_job_status, get_job_result}, download::{download_original, download_result}};
+use services::job_queue::JobQueue;
+use services::worker::BackgroundWorker;
+use std::env;
+use log::info;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    HttpServer::new(|| {
+    // 로깅 초기화
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    
+    println!("🚀 Document Parser System - Phase 4 시작");
+    println!("📋 지원 포맷: PDF, DOCX, XLSX, TXT, MD");
+    println!("🌐 서버 주소: http://0.0.0.0:8080");
+    println!("⚙️ 비동기 작업 큐 활성화됨");
+    
+    // Redis URL 환경변수 또는 기본값 사용
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    info!("Redis 연결: {}", redis_url);
+    
+    let job_queue = JobQueue::new(&redis_url);
+    
+    // 백그라운드 워커 시작 (별도 스레드에서 실행)
+    let worker_job_queue = job_queue.clone();
+    tokio::spawn(async move {
+        info!("백그라운드 워커 시작 중...");
+        let worker = BackgroundWorker::new(worker_job_queue, 5); // 5초마다 작업 확인
+        worker.start().await;
+    });
+
+    HttpServer::new(move || {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header();
         App::new()
+            .app_data(web::Data::new(job_queue.clone()))
+            .wrap(cors)
             .service(healthz)
             .service(upload)
+            .service(get_job_status)
+            .service(get_job_result)
+            .service(download_original)
+            .service(download_result)
     })
     .bind(("0.0.0.0", 8080))?
+    .workers(2) // 워커 스레드 수 설정
     .run()
     .await
 }
