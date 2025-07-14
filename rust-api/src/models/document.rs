@@ -42,6 +42,7 @@ pub struct ParsedContent {
     pub metadata: DocumentMetadata,
     pub thumbnail: Option<String>,      // Base64로 인코딩된 썸네일 이미지
     pub original_file: Option<String>, // Base64로 인코딩된 원본 파일
+    pub html: Option<String>,          // 생성된 편집 가능한 HTML
 }
 
 #[derive(Debug, Serialize, Deserialize)]

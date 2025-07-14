@@ -4,7 +4,7 @@ mod services;
 
 use actix_web::{App, HttpServer, web};
 use actix_cors::Cors;
-use handlers::{health::healthz, upload::upload, job::{get_job_status, get_job_result}, download::{download_original, download_result}};
+use handlers::{health::healthz, upload::upload, job::{get_job_status, get_job_result}, download::{download_original, download_result}, static_files::serve_image};
 use services::job_queue::JobQueue;
 use services::worker::BackgroundWorker;
 use std::env;
@@ -48,6 +48,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_job_result)
             .service(download_original)
             .service(download_result)
+            .service(serve_image)
     })
     .bind(("0.0.0.0", 8080))?
     .workers(2) // 워커 스레드 수 설정

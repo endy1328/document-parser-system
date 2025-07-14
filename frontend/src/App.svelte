@@ -1,270 +1,455 @@
 <script>
-	import { onMount, onDestroy, tick } from 'svelte';
-	import { Splitpanes, Pane } from 'svelte-splitpanes';
-	import * as monaco from 'monaco-editor';
-	import * as pdfjsLib from 'pdfjs-dist';
+import { onMount, onDestroy, tick } from 'svelte';
+import { Splitpanes, Pane } from 'svelte-splitpanes';
+import * as monaco from 'monaco-editor';
+import * as pdfjsLib from 'pdfjs-dist';
+import JSZip from 'jszip';
 
-	let files = [];
-	let uploading = false;
-	let error = null;
+// Monaco Editor 워커 환경 설정
+if (typeof window !== 'undefined') {
+	window.MonacoEnvironment = {
+		getWorkerUrl: function (moduleId, label) {
+			if (label === 'html' || label === 'handlebars' || label === 'razor') {
+				return './monaco-editor/esm/vs/language/html/html.worker.js';
+			}
+			if (label === 'css' || label === 'scss' || label === 'less') {
+				return './monaco-editor/esm/vs/language/css/css.worker.js';
+			}
+			if (label === 'javascript' || label === 'typescript') {
+				return './monaco-editor/esm/vs/language/typescript/ts.worker.js';
+			}
+			return './monaco-editor/esm/vs/editor/editor.worker.js';
+		}
+	};
+}
 
-	// 작업 관련 상태
-	let currentJob = null;
-	let jobHistory = [];
-	let pollingInterval = null;
-	let selectedJobId = null;
+let showHtmlModal = false;
+let pdfCanvas; // PDF 뷰어에서 <canvas bind:this={pdfCanvas}> 바인딩용
+let pdfDocument = null; // PDF.js 문서 객체 (전역 선언)
 
-	// 작업 상태 및 결과
-	let jobStatus = null;
-	let jobResult = null;
-	let parsedContent = null; // 파싱된 내용을 저장할 변수
-	let jobId = null;
-	let result = null;
+// === Svelte template에서 사용하는 주요 상태 변수 선언 (IDE 경고 방지) ===
+let pollingInterval = null;
+let uploading = false;
+let files = [];
+let errorMessage = '';
+let error = null;
+let currentJob = null;
+let jobStatus = null;
+let jobResult = null;
+let selectedJobId = null;
+let jobHistory = [];
+let activeTab = 'preview';
+let pdfPageNum = 1;
+let pdfPageCount = 1;
+// === ===
+let htmlModalElement;
 
-	// Phase 4 UI 상태
-	let activeTab = 'preview';
-	let showHtmlModal = false;
-	let htmlModalElement;
-	let editableHtml = '';
+// 2차 구현: HTML 미리보기 모달 고급 기능 상태
+let htmlModalMode = 'original'; // 'original' | 'edited' | 'diff'
+let monacoHtmlOriginalContainer, monacoHtmlEditedContainer, monacoHtmlDiffContainer;
+let monacoHtmlOriginalEditor = null, monacoHtmlEditedEditor = null, monacoHtmlDiffEditor = null;
+let originalHtmlValue = '';
+let editedHtmlValue = '';
+let htmlDiffModel = null;
 
-	$: if (showHtmlModal && jobResult?.result?.content) {
-		editableHtml = generateEnhancedHtml(jobResult.result.content);
+// 모달이 열릴 때 원본/수정본 값 초기화
+$: if (showHtmlModal && jobResult?.result?.content) {
+	// 원본 값: HTML 코드가 string 형태로 들어가도록 보장
+	let htmlRaw = jobResult.result.content.html || jobResult.result.content.text || '';
+	
+	// 만약 htmlRaw가 단순 텍스트라면 HTML로 변환
+	// HTML태그가 없거나 공백문자로만 이루어져 있으면 변환 필요
+	if (htmlRaw && (!htmlRaw.includes('<') || htmlRaw.trim().length === 0)) {
+		// generateEnhancedHtml 함수를 사용하여 텍스트를 HTML로 변환
+		console.log('[HTML Modal DEBUG] 텍스트를 HTML로 변환 시도');
+		htmlRaw = generateEnhancedHtml({ text: htmlRaw });
 	}
-
-	function saveEditedHtml() {
-		alert('수정된 HTML이 저장되었습니다.');
+	
+	originalHtmlValue = typeof htmlRaw === 'string' ? htmlRaw : '';
+	
+	// 디버깅: 실제로 설정되는 값 확인
+	console.log('[HTML Modal DEBUG] jobResult.result.content:', jobResult.result.content);
+	console.log('[HTML Modal DEBUG] htmlRaw (before processing):', jobResult.result.content.html || jobResult.result.content.text || '');
+	console.log('[HTML Modal DEBUG] htmlRaw (after processing):', htmlRaw);
+	console.log('[HTML Modal DEBUG] originalHtmlValue:', originalHtmlValue);
+	console.log('[HTML Modal DEBUG] originalHtmlValue.length:', originalHtmlValue.length);
+	console.log('[HTML Modal DEBUG] Is HTML content?:', originalHtmlValue.includes('<') && originalHtmlValue.includes('>'));
+	
+	// 추가 디버깅: 원본 텍스트 데이터 샘플 확인
+	const originalText = jobResult.result.content.text || '';
+	console.log('[HTML Modal DEBUG] 원본 텍스트 데이터 샘플 (100자):', originalText.substring(0, 100));
+	console.log('[HTML Modal DEBUG] 전체 텍스트 길이:', originalText.length);
+	
+	// 표 인식 테스트
+	const lines = originalText.split('\n');
+	const sampleLines = lines.slice(0, 10);
+	console.log('[HTML Modal DEBUG] 처음 10줄 샘플:', sampleLines);
+	
+	// 표 인식 테스트 시연
+	sampleLines.forEach((line, idx) => {
+		if (line.trim() !== '') {
+			const hasTab = line.includes('\t');
+			const hasMultipleSpaces = /\s{2,}/.test(line);
+			const hasPipe = line.includes('|');
+			console.log(`[HTML Modal DEBUG] 줄 ${idx}: 탭=${hasTab}, 다중공백=${hasMultipleSpaces}, 파이프=${hasPipe}, 내용: "${line}"`);
+		}
+	});
+	
+	// 수정본 값: 이전에 편집한 값이 있으면 유지, 없으면 원본 복사
+	if (!editedHtmlValue) {
+		editedHtmlValue = originalHtmlValue;
 	}
+	// 에디터가 항상 최신 값을 반영하도록 dispose 후 mount
+	disposeHtmlEditors();
+	tick().then(() => {
+		mountHtmlEditors();
+	});
+}
 
-	// 모달 포커스 처리를 위한 액션
-	function modalFocus(node) {
-		if (showHtmlModal) {
-			node.focus();
-			
-			// ESC 키로 모달 닫기
-			const handleKeydown = (event) => {
-				if (event.key === 'Escape') {
-					showHtmlModal = false;
-				}
-			};
-			
-			window.addEventListener('keydown', handleKeydown);
-			
-			return {
-				destroy() {
-					window.removeEventListener('keydown', handleKeydown);
-				}
-			};
-		}
-	} // preview, json, raw
-	let pdfDocument = null;
-	let pdfPageNum = 1;
-	let pdfPageCount = 0;
-	let pdfCanvas = null;
-	let jsonEditor = null;
-	let jsonEditorContainer = null;
-	let originalDocumentElement = null;
-	let showOriginalDocument = true;
-	let showHistory = false;
+// 모달이 닫힐 때 에디터 dispose 및 값 초기화
+$: if (!showHtmlModal) {
+	disposeHtmlEditors();
+	htmlModalMode = 'original';
+}
 
-	// 텍스트를 원본 문서 구조를 유지하는 HTML로 변환 (표, 이미지, 레이아웃 포함)
-	function textToHtml(text) {
-		if (!text) return '';
+// 모드 전환 시 에디터 mount/dispose
+$: if (showHtmlModal) {
+	tick().then(() => {
+		mountHtmlEditors();
+	});
+}
+
+function mountHtmlEditors() {
+	// 원본 에디터 (읽기 전용)
+	if (htmlModalMode === 'original' && monacoHtmlOriginalContainer && !monacoHtmlOriginalEditor) {
+		// 디버깅: 에디터에 전달되는 값 확인
+		console.log('[MONACO DEBUG] Creating original editor with value:', originalHtmlValue);
+		console.log('[MONACO DEBUG] Value length:', originalHtmlValue.length);
+		console.log('[MONACO DEBUG] Value preview:', originalHtmlValue.substring(0, 200) + '...');
 		
-		// HTML 이스케이프 처리
-		let html = text
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;");
+		monacoHtmlOriginalEditor = monaco.editor.create(monacoHtmlOriginalContainer, {
+			value: originalHtmlValue,
+			language: 'html', // HTML 코드 하이라이팅
+			readOnly: true,
+			theme: 'vs-light',
+			automaticLayout: true,
+			minimap: { enabled: false },
+			fontSize: 15,
+			lineNumbers: 'on',
+			wordWrap: 'on',
+		});
 		
-		// 줄별로 분리하여 처리
-		const lines = html.split('\n');
-		const processedLines = [];
-		let inList = false;
-		let inTable = false;
-		let tableRows = [];
+		// 디버깅: 에디터 생성 후 실제 값 확인
+		console.log('[MONACO DEBUG] Editor created, getting value:', monacoHtmlOriginalEditor.getValue());
+	}
+	// 수정본 에디터
+	if (htmlModalMode === 'edited' && monacoHtmlEditedContainer && !monacoHtmlEditedEditor) {
+		monacoHtmlEditedEditor = monaco.editor.create(monacoHtmlEditedContainer, {
+			value: editedHtmlValue,
+			language: 'html',
+			readOnly: false,
+			theme: 'vs-light',
+			automaticLayout: true,
+			minimap: { enabled: false },
+			fontSize: 15,
+			lineNumbers: 'on',
+		});
+		monacoHtmlEditedEditor.onDidChangeModelContent(() => {
+			editedHtmlValue = monacoHtmlEditedEditor.getValue();
+		});
+	}
+	// Diff Editor
+	if (htmlModalMode === 'diff' && monacoHtmlDiffContainer && !monacoHtmlDiffEditor) {
+		const originalModel = monaco.editor.createModel(originalHtmlValue, 'html');
+		const editedModel = monaco.editor.createModel(editedHtmlValue, 'html');
+		htmlDiffModel = { original: originalModel, modified: editedModel };
+		monacoHtmlDiffEditor = monaco.editor.createDiffEditor(monacoHtmlDiffContainer, {
+			enableSplitViewResizing: true,
+			readOnly: true,
+			theme: 'vs-light',
+			automaticLayout: true,
+			fontSize: 15,
+			lineNumbers: 'on',
+			minimap: { enabled: false },
+		});
+		monacoHtmlDiffEditor.setModel(htmlDiffModel);
+	}
+}
+
+function disposeHtmlEditors() {
+	if (monacoHtmlOriginalEditor) {
+		monacoHtmlOriginalEditor.dispose();
+		monacoHtmlOriginalEditor = null;
+	}
+	if (monacoHtmlEditedEditor) {
+		monacoHtmlEditedEditor.dispose();
+		monacoHtmlEditedEditor = null;
+	}
+	if (monacoHtmlDiffEditor) {
+		monacoHtmlDiffEditor.dispose();
+		monacoHtmlDiffEditor = null;
+		if (htmlDiffModel) {
+			htmlDiffModel.original.dispose();
+			htmlDiffModel.modified.dispose();
+			htmlDiffModel = null;
+		}
+	}
+}
+
+function modalFocus(node) {
+	if (showHtmlModal) {
+		node.focus();
+		// ESC 키로 모달 닫기
+		const handleKeydown = (event) => {
+			if (event.key === 'Escape') {
+				showHtmlModal = false;
+			}
+		};
+		window.addEventListener('keydown', handleKeydown);
+		return {
+			destroy() {
+				window.removeEventListener('keydown', handleKeydown);
+			}
+		};
+	}
+}
+
+// 텍스트를 원본 문서 구조를 유지하는 HTML로 변환 (표, 이미지, 레이아웃 포함)
+function textToHtml(text) {
+	if (!text) return '';
+	
+	// HTML 이스케이프 처리
+	let html = text
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;");
+	
+	// 줄별로 분리하여 처리
+	const lines = html.split('\n');
+	const processedLines = [];
+	let inList = false;
+	let inTable = false;
+	let tableRows = [];
+	
+	// 표 구조 감지 함수 - 개선버전
+	function isTableRow(line) {
+		// 탭 구분 데이터 감지 
+		const tabParts = line.split('\t');
+		const tabSeparated = tabParts.length > 2 && tabParts.filter(p => p.trim() !== '').length > 1;
+
+		// 두 개 이상의 공백으로 구분된 데이터 감지
+		const spaceParts = line.split(/\s{2,}/);
+		const spaceSeparated = spaceParts.length > 2 && spaceParts.filter(p => p.trim() !== '').length > 1;
+
+		// 파이프 기호로 구분된 데이터 감지
+		const pipeParts = line.split('|');
+		const hasPipeSymbol = pipeParts.length > 2 && pipeParts.filter(p => p.trim() !== '').length > 1;
+
+		// 정규적인 간격으로 배열된 데이터 감지 (표 형태)
+		const hasRegularSpacing = /\S+\s{2,}\S+\s{2,}\S+/.test(line);
+
+		const isTable = tabSeparated || spaceSeparated || hasPipeSymbol || hasRegularSpacing;
+		if (isTable) {
+			console.log('[TABLE DEBUG] 표 행 발견:', line, { tabSeparated, spaceSeparated, hasPipeSymbol, hasRegularSpacing });
+		}
+		return isTable;
+	}
+	
+	// 표 행 처리 함수 - 개선버전
+	function processTableRow(line) {
+		console.log('표 행 처리:', line);
+		let cells = [];
+
+		// 파이프 기호로 구분된 경우 처리
+		if (line.includes('|')) {
+			cells = line.split('|')
+				.map(cell => cell.trim())
+				.filter(cell => cell.length > 0);
+			console.log('파이프 구분 셀:', cells);
+		} 
+		// 탭으로 구분된 경우 처리
+		else if (line.includes('\t')) {
+			cells = line.split('\t')
+				.map(cell => cell.trim())
+				.filter(cell => cell.length > 0);
+			console.log('탭 구분 셀:', cells);
+		} 
+		// 두 개 이상의 공백으로 구분된 경우 처리
+		else {
+			cells = line.split(/\s{2,}/)
+				.map(cell => cell.trim())
+				.filter(cell => cell.length > 0);
+			console.log('공백 구분 셀:', cells);
+		}
+
+		// 셀 데이터 검증
+		if (cells.length < 2) {
+			console.warn('표 행 처리 결과 셀이 부족함:', cells.length);
+		}
+
+		return cells;
+	}
+	
+	// 표 완료 처리 함수 - 개선버전
+	function finishTable() {
+		if (tableRows.length > 0) {
+			console.log('표 생성 시작:', tableRows.length, '행');
+			
+			// 모든 행의 셀 수가 다를 수 있으므로 최대 셀 수 찾기
+			const maxCells = Math.max(...tableRows.map(row => row.length));
+			console.log('표의 최대 셀 수:', maxCells);
+			
+			// 표 시작
+			processedLines.push('<table border="1" style="border-collapse: collapse; width: 100%; margin: 1rem 0;">');
+			
+			// 표 행 처리
+			tableRows.forEach((row, index) => {
+				const isHeader = index === 0;
+				const tag = isHeader ? 'th' : 'td';
+				const style = isHeader ? 'background-color: #f5f5f5; font-weight: bold;' : '';
+				
+				// 행 시작
+				processedLines.push('<tr>');
+				
+				// 부족한 셀 채우기 (maxCells로 통일)
+				for (let i = 0; i < maxCells; i++) {
+					const cellContent = i < row.length ? row[i] : '';
+					processedLines.push(`<${tag} style="padding: 8px; border: 1px solid #ddd; ${style}">${cellContent}</${tag}>`);
+				}
+				
+				// 행 끝
+				processedLines.push('</tr>');
+			});
+			
+			// 표 끝
+			processedLines.push('</table>');
+			tableRows = [];
+			console.log('표 생성 완료');
+		}
+		inTable = false;
+	}
+	
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i].trim();
+		const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
 		
-		// 표 구조 감지 함수
-		function isTableRow(line) {
-			// 탭이나 여러 공백으로 구분된 데이터 감지
-			const tabSeparated = line.split('\t').length > 2;
-			const spaceSeparated = line.split(/\s{2,}/).length > 2;
-			const hasPipeSymbol = line.includes('|');
-			return tabSeparated || spaceSeparated || hasPipeSymbol;
+		// 빈 줄 처리
+		if (line === '') {
+			if (inTable) finishTable();
+			processedLines.push('<br>');
+			continue;
+		}
+
+		// 표 행 처리
+		if (isTableRow(line)) {
+			const cells = processTableRow(line);
+			if (cells.length > 1) {
+				if (!inTable) {
+					inTable = true;
+				}
+				tableRows.push(cells);
+				continue;
+			}
+		} else if (inTable) {
+			finishTable();
 		}
 		
-		// 표 행 처리 함수
-		function processTableRow(line) {
-			let cells = [];
-			if (line.includes('|')) {
-				cells = line.split('|').map(cell => cell.trim()).filter(cell => cell.length > 0);
-			} else if (line.includes('\t')) {
-				cells = line.split('\t').map(cell => cell.trim()).filter(cell => cell.length > 0);
-			} else {
-				cells = line.split(/\s{2,}/).map(cell => cell.trim()).filter(cell => cell.length > 0);
-			}
-			return cells;
-		}
-		
-		// 표 완료 처리 함수
-		function finishTable() {
-			if (tableRows.length > 0) {
-				processedLines.push('<table border="1" style="border-collapse: collapse; width: 100%; margin: 1rem 0;">');
-				tableRows.forEach((row, index) => {
-					const isHeader = index === 0;
-					const tag = isHeader ? 'th' : 'td';
-					const style = isHeader ? 'background-color: #f5f5f5; font-weight: bold;' : '';
-					processedLines.push('<tr>');
-					row.forEach(cell => {
-						processedLines.push(`<${tag} style="padding: 8px; border: 1px solid #ddd; ${style}">${cell}</${tag}>`);
-					});
-					processedLines.push('</tr>');
-				});
-				processedLines.push('</table>');
-				tableRows = [];
-			}
-			inTable = false;
-		}
-		
-		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i].trim();
-			const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
-			
-			// 빈 줄 처리
-			if (line === '') {
-				if (inTable) {
-					finishTable();
-				}
-				if (inList) {
-					processedLines.push(`</${inList}>`);
-					inList = false;
-				}
-				processedLines.push('<br>');
-				continue;
-			}
-			
-			// 표 구조 감지 및 처리
-			if (isTableRow(line)) {
-				if (inList) {
-					processedLines.push(`</${inList}>`);
-					inList = false;
-				}
-				const cells = processTableRow(line);
-				if (cells.length > 1) {
-					if (!inTable) {
-						inTable = true;
-					}
-					tableRows.push(cells);
-					continue;
-				}
-			} else if (inTable) {
-				finishTable();
-			}
-			
-			// 메인 제목 (1줄이고 다음줄이 비어있거나 짧을 때)
-			if (i === 0 || (line.length > 10 && line.length < 50 && nextLine === '')) {
-				if (inList) {
-					processedLines.push(`</${inList}>`);
-					inList = false;
-				}
-				processedLines.push(`<h1 style="color: #333; margin-top: 2rem; margin-bottom: 1rem; font-size: 1.5em; font-weight: bold;">${line}</h1>`);
-				continue;
-			}
-			
-			// 목차 제목
-			if (line.match(/^(목차|Table of Contents|정의|Contents)$/i)) {
-				if (inList) {
-					processedLines.push(`</${inList}>`);
-					inList = false;
-				}
-				processedLines.push(`<h2 style="color: #555; margin-top: 1.5rem; margin-bottom: 0.5rem; font-size: 1.3em; font-weight: bold;">${line}</h2>`);
-				continue;
-			}
-			
-			// 숫자 리스트 (1. 2. 3. 또는 1) 2) 3) 형태)
-			if (line.match(/^[0-9]+[\.\)]\s+.+/)) {
-				if (inList !== 'ol') {
-					if (inList) processedLines.push(`</${inList}>`);
-					processedLines.push('<ol style="margin: 0.5rem 0; padding-left: 2rem;">');
-					inList = 'ol';
-				}
-				const content = line.replace(/^[0-9]+[\.\)]\s+/, '');
-				processedLines.push(`<li style="margin-bottom: 0.25rem;">${content}</li>`);
-				continue;
-			}
-			
-			// 불릿 리스트 (- 또는 • 시작)
-			if (line.match(/^[\-•]\s+.+/)) {
-				if (inList !== 'ul') {
-					if (inList) processedLines.push(`</${inList}>`);
-					processedLines.push('<ul style="margin: 0.5rem 0; padding-left: 2rem;">');
-					inList = 'ul';
-				}
-				const content = line.replace(/^[\-•]\s+/, '');
-				processedLines.push(`<li style="margin-bottom: 0.25rem;">${content}</li>`);
-				continue;
-			}
-			
-			// 소제목 (숫자.숫자 형태 또는 짧은 제목성 라인)
-			if (line.match(/^[0-9]+\.[0-9]+/) || (line.length < 40 && line.match(/^[A-Za-z가-힣].*[가-힣A-Za-z]$/))) {
-				if (inList) {
-					processedLines.push(`</${inList}>`);
-					inList = false;
-				}
-				processedLines.push(`<h3 style="color: #666; margin-top: 1rem; margin-bottom: 0.5rem; font-size: 1.1em; font-weight: bold;">${line}</h3>`);
-				continue;
-			}
-			
-			// 일반 문단
+		// 메인 제목 (1줄이고 다음줄이 비어있거나 짧을 때)
+		if (i === 0 || (line.length > 10 && line.length < 50 && nextLine === '')) {
 			if (inList) {
 				processedLines.push(`</${inList}>`);
 				inList = false;
 			}
-			processedLines.push(`<p style="margin: 0.5rem 0; line-height: 1.6; text-align: justify;">${line}</p>`);
+			processedLines.push(`<h1 style="color: #333; margin-top: 2rem; margin-bottom: 1rem; font-size: 1.5em; font-weight: bold;">${line}</h1>`);
+			continue;
 		}
 		
-		// 마지막에 열린 구조 닫기
-		if (inTable) {
-			finishTable();
+		// 목차 제목
+		if (line.match(/^(목차|Table of Contents|정의|Contents)$/i)) {
+			if (inList) {
+				processedLines.push(`</${inList}>`);
+				inList = false;
+			}
+			processedLines.push(`<h2 style="color: #555; margin-top: 1.5rem; margin-bottom: 0.5rem; font-size: 1.3em; font-weight: bold;">${line}</h2>`);
+			continue;
 		}
+		
+		// 숫자 리스트 (1. 2. 3. 또는 1) 2) 3) 형태)
+		if (line.match(/^[0-9]+[\.\)]\s+.+/)) {
+			if (inList !== 'ol') {
+				if (inList) processedLines.push(`</${inList}>`);
+				processedLines.push('<ol style="margin: 0.5rem 0; padding-left: 2rem;">');
+				inList = 'ol';
+			}
+			const content = line.replace(/^[0-9]+[\.\)]\s+/, '');
+			processedLines.push(`<li style="margin-bottom: 0.25rem;">${content}</li>`);
+			continue;
+		}
+			
+		// 불릿 리스트 (- 또는 • 시작)
+		if (line.match(/^[\-•]\s+.+/)) {
+			if (inList !== 'ul') {
+				if (inList) processedLines.push(`</${inList}>`);
+				processedLines.push('<ul style="margin: 0.5rem 0; padding-left: 2rem;">');
+				inList = 'ul';
+			}
+			const content = line.replace(/^[\-•]\s+/, '');
+			processedLines.push(`<li style="margin-bottom: 0.25rem;">${content}</li>`);
+			continue;
+		}
+		
+		// 소제목 (숫자.숫자 형태 또는 짧은 제목성 라인)
+		if (line.match(/^[0-9]+\.[0-9]+/) || (line.length < 40 && line.match(/^[A-Za-z가-힣].*[가-힣A-Za-z]$/))) {
+			if (inList) {
+				processedLines.push(`</${inList}>`);
+				inList = false;
+			}
+			processedLines.push(`<h3 style="color: #666; margin-top: 1rem; margin-bottom: 0.5rem; font-size: 1.1em; font-weight: bold;">${line}</h3>`);
+			continue;
+		}
+		
+		// 일반 문단
 		if (inList) {
 			processedLines.push(`</${inList}>`);
+			inList = false;
 		}
-		
-		return processedLines.join('\n');
+		processedLines.push(`<p style="margin: 0.5rem 0; line-height: 1.6; text-align: justify;">${line}</p>`);
+	}
+	
+	// 마지막에 열린 구조 닫기
+	if (inTable) {
+		finishTable();
+	}
+	if (inList) {
+		processedLines.push(`</${inList}>`);
+	}
+	
+	return processedLines.join('\n');
 	}
 	
 	// 안정적인 HTML 생성 (회색 화면 문제 해결 최우선)
 	function generateEnhancedHtml(content) {
+		console.log('[DEBUG] generateEnhancedHtml 진입', content);
 		try {
-			if (!content || !content.text) return '내용이 없습니다.';
-			
-			// 기본 스타일링을 가진 컨테이너
-			let result = '<div style="font-family: system-ui, -apple-system, sans-serif; line-height: 1.5;">';
-			
-			// 텍스트 처리 - 줄단위로 간단하게 처리
-			const lines = content.text.split('\n');
-			for (let i = 0; i < Math.min(lines.length, 1000); i++) { // 최대 1000줄로 제한
-				const line = lines[i];
-				if (!line.trim()) {
-					// 빈 줄은 단순 줄바꿈으로 처리
-					result += '<br>';
-					continue;
-				}
-				
-				// 제목 형태의 텍스트 감지 (짧고 중요해 보이는 텍스트)
-				if ((i === 0 && line.length < 100) || 
-				    line.match(/^[0-9]+[\.]/) || 
-				    (line.length < 50 && line.toUpperCase() === line)) {
-					result += `<h3 style="margin:0.8rem 0 0.5rem;font-size:1.1em;color:#333;font-weight:bold;">${escapeHtml(line)}</h3>`;
-				}
-				// 목록 항목 감지
-				else if (line.match(/^[\-•*]\s+/) || line.match(/^[0-9]+[\.):]\s+/)) {
-					result += `<div style="margin:0.25rem 0 0.25rem 1rem;">${escapeHtml(line)}</div>`;
-				}
-				// 일반 텍스트
-				else {
-					result += `<div style="margin:0.3rem 0;">${escapeHtml(line)}</div>`;
-				}
+			if (!content || !content.text) {
+				console.log('[DEBUG] generateEnhancedHtml: 내용 없음');
+				return '내용이 없습니다.';
 			}
+
+			console.log('[DEBUG] 텍스트 길이:', content.text.length, '줄 수:', content.text.split('\n').length);
+			// 프리징 방지: 너무 큰 텍스트/줄수 제한
+			if (content.text.length > 100000 || content.text.split('\n').length > 2000) {
+				console.warn('[DEBUG] 텍스트가 너무 커서 미리보기 불가');
+				return '<div style="color:#a00;padding:2em;text-align:center;font-weight:bold;">HTML 미리보기 불가: 문서가 너무 큽니다.<br>100KB 이하, 2000줄 이하의 텍스트만 미리보기가 지원됩니다.</div>';
+			}
+			
+			// textToHtml 함수를 사용하여 더 고급 HTML 변환
+			console.log('[generateEnhancedHtml DEBUG] textToHtml 호출 전, content.text:', content.text.substring(0, 200));
+			const enhancedHtml = textToHtml(content.text);
+			console.log('[generateEnhancedHtml DEBUG] textToHtml 결과:', enhancedHtml.substring(0, 500));
+			console.log('[generateEnhancedHtml DEBUG] HTML에 표가 포함되어 있나?:', enhancedHtml.includes('<table'));
+			
+			let result = '<div style="font-family: system-ui, -apple-system, sans-serif; line-height: 1.5;">';
+			result += enhancedHtml;
 			
 			// 이미지 삽입 (썸네일이 있는 경우) - 텍스트 뒤에 추가
 			if (content.thumbnail && content.thumbnail.startsWith('data:image/')) {
@@ -414,24 +599,43 @@
 
 	// PDF 페이지 렌더링
 	async function renderPdfPage() {
-		console.log('PDF 렌더링 시도: pdfDocument =', !!pdfDocument, 'pdfCanvas =', !!pdfCanvas);
-		if (!pdfDocument || !pdfCanvas) {
-			console.warn('PDF 렌더링 불가: pdfDocument 또는 pdfCanvas 없음');
-			console.log('pdfDocument:', pdfDocument);
-			console.log('pdfCanvas:', pdfCanvas);
+		// DOM이 업데이트될 때까지 기다림
+		await tick();
+		
+		if (!pdfDocument) {
+			console.warn('PDF 렌더링 불가: pdfDocument 없음');
 			return;
 		}
+		
+		if (!pdfCanvas) {
+			console.warn('PDF 렌더링 불가: pdfCanvas 없음');
+			return;
+		}
+		
 		try {
 			console.log('PDF 페이지', pdfPageNum, '렌더링 시작');
 			const page = await pdfDocument.getPage(pdfPageNum);
 			const viewport = page.getViewport({ scale: 1.5 });
+			
+			// 캔버스 컨텍스트가 유효한지 다시 확인
+			if (!pdfCanvas) {
+				console.error('PDF 렌더링 오류: 캔버스 요소가 null');
+				return;
+			}
+			
 			const context = pdfCanvas.getContext('2d');
+			if (!context) {
+				console.error('PDF 렌더링 오류: 캔버스 컨텍스트를 가져올 수 없음');
+				return;
+			}
+			
 			pdfCanvas.height = viewport.height;
 			pdfCanvas.width = viewport.width;
 			console.log('캔버스 크기 설정:', pdfCanvas.width, 'x', pdfCanvas.height);
-			console.log('캔버스 스타일:', window.getComputedStyle(pdfCanvas).display, window.getComputedStyle(pdfCanvas).visibility);
+			
+			// 렌더링 실행
 			await page.render({ canvasContext: context, viewport }).promise;
-			console.log('PDF 페이지 렌더링 완료 ');
+			console.log('PDF 페이지 렌더링 완료');
 		} catch (e) {
 			console.error('PDF 페이지 렌더링 오류:', e);
 		}
@@ -557,6 +761,111 @@
 		}
 	}
 
+	// HTML 및 이미지 다운로드 함수
+	async function downloadHtmlWithImages() {
+		// HTML 콘텐츠: 에디터가 열려 있으면 그 값을, 아니면 jobResult.result.html 사용
+		let htmlContent = '';
+		if (showHtmlModal) {
+			if (htmlModalMode === 'edited' && monacoHtmlEditedEditor) {
+				htmlContent = monacoHtmlEditedEditor.getValue();
+			} else if (htmlModalMode === 'original' && monacoHtmlOriginalEditor) {
+				htmlContent = monacoHtmlOriginalEditor.getValue();
+			} else if (htmlModalMode === 'diff' && monacoHtmlDiffEditor) {
+				// diff 에디터는 수정본 기준 value 사용
+				const model = monacoHtmlDiffEditor.getModel();
+				if (model && model.modified) {
+					htmlContent = model.modified.getValue();
+				}
+			}
+		}
+		if (!htmlContent && jobResult && jobResult.result && jobResult.result.html) {
+			htmlContent = jobResult.result.html;
+		}
+		if (!htmlContent || htmlContent.trim() === '') {
+			alert('다운로드할 HTML 콘텐츠가 없습니다.');
+			return;
+		}
+		
+		try {
+			// ZIP 파일 생성
+			const zip = new JSZip();
+			
+			// HTML 콘텐츠는 이미 위에서 설정됨
+			
+			// HTML 파일을 ZIP에 추가
+			const baseFilename = jobResult.filename ? jobResult.filename.split('.')[0] : `document-${jobResult.job_id}`;
+			zip.file(`${baseFilename}.html`, htmlContent);
+			
+			// HTML에서 이미지 참조 찾기
+			const imagePattern = /src="\.\/images\/([^"]+)"/g;
+			const imageFiles = new Set();
+			let match;
+			
+			while ((match = imagePattern.exec(htmlContent)) !== null) {
+				imageFiles.add(match[1]);
+			}
+			
+			// 이미지 파일들을 서버에서 가져와서 ZIP에 추가
+			if (imageFiles.size > 0) {
+				const imagesFolder = zip.folder('images');
+				
+				for (const imageFile of imageFiles) {
+					try {
+						// 서버에서 이미지 파일 가져오기
+						const imageResponse = await fetch(`http://localhost:8080/images/${imageFile}`);
+						if (imageResponse.ok) {
+							const imageBlob = await imageResponse.blob();
+							imagesFolder.file(imageFile, imageBlob);
+							console.log(`이미지 추가됨: ${imageFile}`);
+						} else {
+							console.warn(`이미지를 찾을 수 없음: ${imageFile}`);
+						}
+					} catch (imgError) {
+						console.error(`이미지 생성 오류 (${imageFile}):`, imgError);
+					}
+				}
+			}
+			
+			// README 파일 추가
+			const readmeContent = `# ${baseFilename}
+
+이 파일들은 Document Parser System에서 생성된 HTML 미리보기 파일입니다.
+
+## 파일 구성
+- ${baseFilename}.html: 메인 HTML 파일
+- images/: 추출된 이미지 파일들
+
+## 사용 방법
+1. 모든 파일을 동일한 폴더에 압축 해제합니다.
+2. ${baseFilename}.html 파일을 웹 브라우저로 엽니다.
+3. HTML 파일을 자유롭게 편집할 수 있습니다.
+
+생성 시간: ${new Date().toLocaleString('ko-KR')}
+`;
+			zip.file('README.md', readmeContent);
+			
+			// ZIP 파일 생성 및 다운로드
+			const zipBlob = await zip.generateAsync({ type: 'blob' });
+			
+			// 다운로드 링크 생성 및 클릭
+			const link = document.createElement('a');
+			link.href = URL.createObjectURL(zipBlob);
+			link.download = `${baseFilename}-html-preview.zip`;
+			link.click();
+			
+			// 메모리 해제
+			setTimeout(() => {
+				URL.revokeObjectURL(link.href);
+			}, 100);
+			
+			console.log('HTML 다운로드 완료:', `${baseFilename}-html-preview.zip`);
+			
+		} catch (error) {
+			console.error('HTML 다운로드 오류:', error);
+			alert('HTML 다운로드 중 오류가 발생했습니다.');
+		}
+	}
+
 	// 로컬 스토리지에서 작업 히스토리 로드
 	onMount(() => {
 		try {
@@ -672,22 +981,28 @@
 	async function fetchJobStatus(jobId) {
 		try {
 			const response = await fetch(`http://localhost:8080/jobs/${jobId}`);
-			if (response.ok) {
-				jobStatus = await response.json();
-				console.log('작업 상태 업데이트:', jobStatus);
-				
-				// 작업이 완료되면 결과 가져오기
-				if (jobStatus.status === 'completed' || jobStatus.status === 'Completed') {
-					console.log('작업 완료, 결과 가져오기 시도:', jobId);
-					fetchJobResult(jobId);
-					stopPolling(); // 완료되면 폴링 중지
-				} else if (jobStatus.status === 'failed') {
-					error = `작업 실패: ${jobStatus.message || '알 수 없는 오류'}`;
-					stopPolling(); // 실패해도 폴링 중지
+			if (!response.ok) {
+				if (response.status === 404) {
+					errorMessage = '해당 작업을 찾을 수 없습니다. 목록에서 제거합니다.';
+					// jobHistory에서 제거
+					jobHistory = jobHistory.filter(job => job.job_id !== jobId);
+					// 선택된 job이 삭제된 경우, 다른 job으로 자동 포커스
+					if (selectedJobId === jobId) {
+						selectedJobId = jobHistory.length > 0 ? jobHistory[0].job_id : null;
+					}
 				}
-			} else {
 				console.error('작업 상태 가져오기 실패:', response.status);
+				return;
 			}
+			// 200(성공)일 때만 정상 처리
+			jobStatus = await response.json();
+			console.log('작업 상태 업데이트:', jobStatus);
+			// 작업 완료 시 폴링 중지
+			if (jobStatus.status === 'completed' || jobStatus.status === 'Completed') {
+				stopPolling();
+				// 필요하다면 결과 가져오기 등 추가 로직
+			}
+			// 이후 로직...
 		} catch (e) {
 			console.error('작업 상태 확인 중 오류:', e);
 		}
@@ -1500,18 +1815,62 @@
 	z-index: 2000;
 }
 .modal-dialog {
-	width: 80vw;
-	max-width: 900px;
+	width: 90vw;
+	height: 90vh;
+	max-width: none !important;
+	max-height: none !important;
 	outline: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	align-items: stretch;
+	justify-content: stretch;
+}
+
+.modal-content {
+	width: 100%;
+	height: 100%;
+	max-width: none;
+	max-height: none;
+	display: flex;
+	flex-direction: column;
+}
+
+.modal-split-body {
+	width: 100%;
+	height: 100%;
+	min-width: 0;
+	min-height: 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+}
+
+:global(.splitpanes) {
+	width: 100% !important;
+	height: 100% !important;
+	min-width: 0;
+	min-height: 0;
+}
+:global(.splitpanes__pane) {
+	width: 0;
+	min-width: 320px;
+	flex: 1 1 0;
+	padding: 0;
+	margin: 0;
+	box-sizing: border-box;
+	display: flex;
+	flex-direction: column;
 }
 .modal-content {
 	background: #fff;
-	border-radius: 8px;
+	border-radius: 0;
 	overflow: hidden;
-	box-shadow: 0 4px 24px rgba(0,0,0,0.18);
+	box-shadow: none;
 	display: flex;
 	flex-direction: column;
-	max-height: 90vh;
+	height: 90vh;
+	max-height: none;
 }
 .modal-header {
 	display: flex;
@@ -1535,35 +1894,58 @@
 	padding: 1rem;
 	overflow-y: auto;
 }
-.html-preview-container {
+
+.monaco-editor-container {
+	height: 38vh;
+	width: 100%;
+	border: 1px solid #eee;
+	border-radius: 4px;
+	background: #f8f9fa;
+	margin-bottom: 0.5rem;
+	font-size: 1.15em;
+}
+.modal-split-body {
+	height: 100%;
+	min-height: 0;
+	padding: 0;
 	display: flex;
 	flex-direction: column;
-	gap: 1.2rem;
 }
-.html-preview-content {
+.editor-pane, .preview-pane {
+	height: 100%;
+	padding: 1.2rem 1.2rem 1.2rem 1.2rem;
+	display: flex;
+	flex-direction: column;
+}
+.editor-label {
+	font-size: 1.15em;
+	margin-bottom: 0.5em;
+	font-weight: 600;
+	color: #444;
+}
+.html-preview-iframe {
+	width: 100%;
+	height: 38vh;
 	border: 1px solid #eee;
 	background: #fff;
-	padding: 1rem;
-	max-height: 350px;
-	overflow: auto;
-	font-family: system-ui, sans-serif;
-	font-size: 1rem;
-	line-height: 1.6;
-}
-.html-code {
-	background: #f8f9fa;
-	border: 1px solid #ddd;
 	border-radius: 4px;
-	padding: 0.5rem;
-	max-height: 200px;
-	overflow: auto;
-	font-size: 0.95em;
 }
+
 @media (max-width: 600px) {
 	.modal-dialog {
 		width: 98vw;
 	}
 }
+
+.error-message {
+  background: #ffe0e0;
+  color: #a00;
+  padding: 0.7em 1em;
+  border-radius: 4px;
+  margin-bottom: 1em;
+  font-weight: bold;
+}
+
 
 	@media (max-width: 768px) {
 
@@ -1601,7 +1983,10 @@
 		{/if}
 	</div>
 
-	<div class="content-section">
+	{#if errorMessage}
+  <div class="error-message">{errorMessage}</div>
+{/if}
+<div class="content-section">
 		<div class="job-status-section">
 			{#if error}
 				<div class="error">
@@ -1877,7 +2262,7 @@
 </div>
 
 <!-- HTML 모달 팝업 -->
-{#if showHtmlModal && jobResult?.result?.content}
+{#if showHtmlModal}
 	<div 
 		class="modal-backdrop" 
 		on:click|self={() => showHtmlModal = false}
@@ -1893,33 +2278,81 @@
 			bind:this={htmlModalElement}
 			use:modalFocus
 		>
-		<div class="modal-content">
-			<div class="modal-header">
-				<h3 id="html-modal-title">HTML 미리보기 및 수정</h3>
-				<button 
-					class="close-button" 
-					on:click={() => showHtmlModal = false}
-					on:keydown={(e) => e.key === 'Enter' && (showHtmlModal = false)}
-					aria-label="모달 닫기"
-				>×</button>
-			</div>
-			<div class="modal-body">
-				<div class="html-preview-container">
-					<div><b>미리보기:</b></div>
-					<div class="html-preview-content">
-						{@html editableHtml}
-					</div>
-					<div><b>HTML 코드 (수정 가능):</b></div>
-					<textarea
-						class="html-code-editor"
-						bind:value={editableHtml}
-						rows="12"
-						spellcheck="false"
-						style="width:100%;font-family:monospace;"
-					/>
-					<button class="save-html-btn" on:click={saveEditedHtml}>저장</button>
+			<div class="modal-content">
+				<div class="modal-header">
+					<h3 id="html-modal-title">HTML 미리보기</h3>
+					<button 
+						class="close-button" 
+						on:click={() => showHtmlModal = false}
+						on:keydown={(e) => e.key === 'Enter' && (showHtmlModal = false)}
+						aria-label="모달 닫기"
+					>×</button>
 				</div>
-			</div>
+				{#if jobResult?.result?.content}
+					<!-- 툴바/탭 컨트롤 -->
+					<div class="html-modal-toolbar">
+						<button class="toolbar-tab {htmlModalMode === 'original' ? 'active' : ''}" on:click={() => htmlModalMode = 'original'}>원본</button>
+						<button class="toolbar-tab {htmlModalMode === 'edited' ? 'active' : ''}" on:click={() => htmlModalMode = 'edited'}>수정본</button>
+						<button class="toolbar-tab {htmlModalMode === 'diff' ? 'active' : ''}" on:click={() => htmlModalMode = 'diff'}>비교(Diff)</button>
+						<div class="toolbar-actions">
+							<button class="toolbar-btn" title="HTML 및 이미지 다운로드" on:click={downloadHtmlWithImages}>💾 다운로드</button>
+							<button class="toolbar-btn" title="초기화" disabled>⟳</button>
+							<button class="toolbar-btn" title="복사" disabled>📋</button>
+						</div>
+					</div>
+					<div class="modal-body modal-split-body">
+						{#if htmlModalMode === 'original'}
+							<Splitpanes>
+								<Pane size={55}>
+									<div class="editor-pane">
+										<div class="editor-label">원본 HTML (읽기 전용)</div>
+										<div bind:this={monacoHtmlOriginalContainer} class="monaco-editor-container"></div>
+									</div>
+								</Pane>
+								<Pane size={45}>
+									<div class="preview-pane">
+										<div class="editor-label">미리보기</div>
+										<iframe class="html-preview-iframe" srcdoc={originalHtmlValue} sandbox="allow-same-origin allow-scripts" title="HTML 미리보기"></iframe>
+									</div>
+								</Pane>
+							</Splitpanes>
+						{:else if htmlModalMode === 'edited'}
+							<Splitpanes>
+								<Pane size={55}>
+									<div class="editor-pane">
+										<div class="editor-label">수정본 HTML (수정 가능)</div>
+										<div bind:this={monacoHtmlEditedContainer} class="monaco-editor-container"></div>
+									</div>
+								</Pane>
+								<Pane size={45}>
+									<div class="preview-pane">
+										<div class="editor-label">미리보기</div>
+										<iframe class="html-preview-iframe" srcdoc={editedHtmlValue} sandbox="allow-same-origin allow-scripts" title="HTML 미리보기"></iframe>
+									</div>
+								</Pane>
+							</Splitpanes>
+						{:else if htmlModalMode === 'diff'}
+							<Splitpanes>
+								<Pane size={60}>
+									<div class="editor-pane">
+										<div class="editor-label">원본 vs. 수정본 비교(Diff)</div>
+										<div bind:this={monacoHtmlDiffContainer} class="monaco-editor-container"></div>
+									</div>
+								</Pane>
+								<Pane size={40}>
+									<div class="preview-pane">
+										<div class="editor-label">수정본 미리보기</div>
+										<iframe class="html-preview-iframe" srcdoc={editedHtmlValue} sandbox="allow-same-origin allow-scripts" title="HTML 미리보기"></iframe>
+									</div>
+								</Pane>
+							</Splitpanes>
+						{/if}
+					</div>
+				{:else}
+					<div style="padding:2em; text-align:center; color:#888;">
+						HTML 데이터를 불러올 수 없습니다.
+					</div>
+				{/if}
 			</div>
 		</div>
 	</div>
